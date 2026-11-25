@@ -1,0 +1,29 @@
+{
+  "ok_split": {
+    "audit_fraction": 0.2,
+    "seed": 20261125
+  },
+  "feature": {
+    "model_name": "dinov2_vitb14_reg",
+    "input_size": 448,
+    "batch_size": 16,
+    "device": "auto"
+  },
+  "tiles": {
+    "size": 448,
+    "stride": 358
+  },
+  "query": {
+    "context_margin_ratio": 0.5,
+    "k": 5
+  },
+  "thresholds": {
+    "warning_percentile": 95.0,
+    "high_percentile": 99.5,
+    "high_multiplier": 1.2
+  },
+  "reports": {
+    "top_n": 100,
+    "formats": ["html", "svg", "png", "json", "npz"]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "target_size": 832,
+  "proto_stride": 4,
+  "proto_size": 208,
+  "risk_thresholds": {
+    "iou_proto": 0.35,
+    "min_proto_nonzero_pixels": 4,
+    "class_high_risk_ratio": 0.15
+  },
+  "reports": {
+    "top_n": 100,
+    "formats": ["html", "png", "json"]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "ok_split": {
+    "audit_fraction": 0.2,
+    "seed": 20261125
+  },
+  "feature": {
+    "model_name": "dinov2_vitb14_reg",
+    "input_size": 448,
+    "batch_size": 8,
+    "device": "auto"
+  },
+  "tiles": {
+    "size": 448,
+    "stride": 358
+  },
+  "position_constraint": {
+    "patch_radius": 2
+  },
+  "patch_calibration": {
+    "warning_percentile": 95.0,
+    "high_percentile": 99.5,
+    "high_multiplier": 1.2
+  },
+  "instance_rules": {
+    "ring_width_px": 5,
+    "weak_normal_ratio": 0.7,
+    "coarse_normal_ratio": 0.4,
+    "boundary_margin": 0.01
+  },
+  "missing_annotation_scan": {
+    "polygon_dilation_px": 5,
+    "edge_exclusion_px": 14,
+    "minimum_component_area_px": 64
+  },
+  "reports": {
+    "top_n": 100,
+    "formats": ["html", "svg", "png", "json", "npz"]
+  }
+}

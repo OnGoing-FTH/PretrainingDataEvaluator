@@ -80,6 +80,33 @@ python scripts/run_stage1.py --input-dir data --top-n 100
 
 报告写入 `outputs/reports/stage1/`，包含缺陷 Query 与最近 OK Tile 的可读对照；产物写入 `outputs/artifacts/stage1/`，包括阈值、查询记录、OK Tile 元数据及压缩特征矩阵（NPZ）。
 
+## Stage 2：DINOv2 Patch 双流异常审查
+
+Stage 2 复用 `dinov2_vitb14_reg` 的 `32 x 32` Patch Token。由隔离 OK_Bank 聚合同位置正常 Patch 原型，并允许 Query 在相邻 `2` 个 Patch 的位置半径内寻找最相似正常原型；Patch 阈值只由独立 OK_Audit 标定。实例流评估 Polygon 内外的异常分布，用于发现疑似虚标、粗标和边界错位；整图流通过重叠滑窗的最小异常距离融合，屏蔽现有标注后提取疑似漏标，同时审查 Audit OK 图是否存在污染。
+
+```bash
+source /home/fth/miniconda3/bin/activate
+conda activate py11
+python scripts/run_stage2.py --input-dir data --top-n 100
+```
+
+报告写入 `outputs/reports/stage2/`，包括疑似虚标、粗标/错位、疑似漏标和 OK 污染四类 HTML 图集；机器可读的阈值、实例指标、候选清单和 Patch 原型写入 `outputs/artifacts/stage2/`。不保存无必要的全量高分辨率异常图，避免审查产物膨胀。
+
+## 五大指导图集生成
+
+完成 Stage 0–2 后执行：
+
+```bash
+python -m pip install -r configs/guidance-requirements.txt
+python scripts/run_guidance.py --top-n 100
+```
+
+统一入口为 `outputs/reports/guidance/index.html`，包含过标/虚标三联图、灰区概率梯度与逐类 UMAP/HDBSCAN 九宫格、粗标污染高亮图、漏标全图定位及放大热图、Proto 消失/断裂对照，以及人工复核 SOP。完整指标、折外预测、分组隔离证据、子簇信息和实例 CLS 特征写入 `outputs/artifacts/guidance/`；不生成 CSV，也不改写标注。
+
+灰区探针使用按原图 SHA-256 分组的五折逻辑回归，所有同图实例及精确重复图像均留在同一折。概率为未校准模型分数，0.40–0.60 为核心灰区，0.35–0.65 为展示上下文。形态子簇使用 CLS 与 0.3 倍标准化几何特征；UMAP 用于展示，HDBSCAN 在组合特征空间聚类。少于 10 个实例的类别跳过聚类。图集 4 复用 Stage 2 的候选，OK 图审查范围为 Audit，按图像哈希和候选位置归并重复项。
+
+当前 Stage 1 未保存实例 CLS，Stage 2 未保存用于图集的异常图，因此首次生成会补算实例 CLS/Patch 和候选局部热图；不重建正常库。单次前向同时复用 CLS 和 Patch。所有热图使用统一的高阈值色标，局部热图为中心上下文重算结果，与滑窗融合分数分别解释。
+
 ## 数据约定
 
 - 输入数据为原图与 YOLO-Seg `.txt` 标注；每行标注包含类别与归一化多边形顶点。

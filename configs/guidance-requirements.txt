@@ -1,0 +1,4 @@
+# 五大指导图集的附加分析依赖；基础图像与 PyTorch 环境沿用 Stage 0–2。
+scikit-learn>=1.6
+umap-learn>=0.5
+hdbscan>=0.8.40

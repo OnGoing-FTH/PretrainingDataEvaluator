@@ -40,19 +40,37 @@ class DinoV2Extractor:
         return requested
 
     def embed_bgr_images(self, images: Iterable[np.ndarray]) -> np.ndarray:
+        vectors = [cls for cls, _ in self.iter_bgr_batches_with_patches(images)]
+        return np.vstack(vectors) if vectors else np.empty((0, 0), dtype=np.float32)
+
+    def embed_bgr_images_with_patches(self, images: Iterable[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """一次前向同时返回 L2 标准化 CLS 与 Patch Token 特征。"""
+        batches = list(self.iter_bgr_batches_with_patches(images))
+        if not batches:
+            return np.empty((0, 0), dtype=np.float32), np.empty((0, 0, 0, 0), dtype=np.float32)
+        return np.vstack([cls for cls, _ in batches]), np.concatenate([patches for _, patches in batches], axis=0)
+
+    def iter_bgr_batches_with_patches(self, images: Iterable[np.ndarray]):
+        """流式返回批量 CLS/Patch 特征，避免累积全量 Patch Token。"""
+        batch_images: list[np.ndarray] = []
+        for image in images:
+            batch_images.append(image)
+            if len(batch_images) >= self.settings.batch_size:
+                yield self._embed_batch_with_patches(batch_images)
+                batch_images = []
+        if batch_images:
+            yield self._embed_batch_with_patches(batch_images)
+
+    def _embed_batch_with_patches(self, images: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
         prepared = [self._prepare(image) for image in images]
-        if not prepared:
-            return np.empty((0, 0), dtype=np.float32)
-        vectors: list[np.ndarray] = []
+        patch_grid = self.settings.input_size // 14
         with self.torch.inference_mode():
-            for offset in range(0, len(prepared), self.settings.batch_size):
-                batch = self.torch.stack(prepared[offset:offset + self.settings.batch_size]).to(self.device)
-                batch = (batch - self._mean) / self._std
-                output = self.model.forward_features(batch)
-                embedding = output["x_norm_clstoken"].float()
-                embedding = self.torch.nn.functional.normalize(embedding, p=2, dim=1)
-                vectors.append(embedding.cpu().numpy().astype(np.float32))
-        return np.vstack(vectors)
+            batch = self.torch.stack(prepared).to(self.device)
+            batch = (batch - self._mean) / self._std
+            output = self.model.forward_features(batch)
+            cls = self.torch.nn.functional.normalize(output["x_norm_clstoken"].float(), p=2, dim=1)
+            patches = self.torch.nn.functional.normalize(output["x_norm_patchtokens"].float(), p=2, dim=2)
+        return cls.cpu().numpy().astype(np.float32), patches.reshape(-1, patch_grid, patch_grid, patches.shape[-1]).cpu().numpy().astype(np.float32)
 
     def _prepare(self, image: np.ndarray) -> "object":
         if image is None or image.size == 0:

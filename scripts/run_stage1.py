@@ -34,7 +34,9 @@ def main() -> int:
     queries, summary, bank_vectors, bank_metadata = run_stage1(args.input_dir, stage0_records, config)
     top_n = args.top_n if args.top_n is not None else config["reports"]["top_n"]
     write_stage1_reports(queries, summary, bank_vectors, bank_metadata, args.report_dir, args.artifact_dir, top_n)
-    print(f"Stage 1 complete: {summary['ok_bank_images']} OK_Bank images, {summary['ok_audit_images']} OK_Audit images, {summary['instance_queries']} ROI queries.")
+    bank_images = sum(cluster["bank_images"] for cluster in summary["cluster_splits"].values())
+    audit_images = sum(cluster["audit_images"] for cluster in summary["cluster_splits"].values())
+    print(f"Stage 1 complete: {summary['clustering']['selected_k']} OK clusters, {bank_images} OK_Bank images, {audit_images} OK_Audit images, {summary['instance_queries']} ROI queries.")
     print(f"HTML report: {args.report_dir / 'index.html'}")
     return 0
 

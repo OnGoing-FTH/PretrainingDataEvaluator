@@ -45,5 +45,5 @@ def split_ok_images(images: list[Path], audit_fraction: float, seed: int) -> tup
     audit_count = max(1, min(len(grouped) - 1, int(round(len(grouped) * audit_fraction))))
     audit_group_indices = set(rng.permutation(len(grouped))[:audit_count].tolist())
     bank = [group[0] for index, group in enumerate(grouped) if index not in audit_group_indices]
-    audit = [path for index, group in enumerate(grouped) if index in audit_group_indices for path in group]
+    audit = [group[0] for index, group in enumerate(grouped) if index in audit_group_indices]
     return bank, audit, {"unique_ok_image_groups": len(grouped), "duplicate_ok_images_excluded_from_bank": len(images) - len(grouped)}

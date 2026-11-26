@@ -43,6 +43,10 @@ class DinoV2Extractor:
         vectors = [cls for cls, _ in self.iter_bgr_batches_with_patches(images)]
         return np.vstack(vectors) if vectors else np.empty((0, 0), dtype=np.float32)
 
+    def embed_global_bgr_images(self, images: Iterable[np.ndarray]) -> np.ndarray:
+        """整图聚类专用：等比例 Letterbox 到模型输入，而非拉伸变形。"""
+        return self.embed_bgr_images(self._letterbox(image) for image in images)
+
     def embed_bgr_images_with_patches(self, images: Iterable[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
         """一次前向同时返回 L2 标准化 CLS 与 Patch Token 特征。"""
         batches = list(self.iter_bgr_batches_with_patches(images))
@@ -71,6 +75,16 @@ class DinoV2Extractor:
             cls = self.torch.nn.functional.normalize(output["x_norm_clstoken"].float(), p=2, dim=1)
             patches = self.torch.nn.functional.normalize(output["x_norm_patchtokens"].float(), p=2, dim=2)
         return cls.cpu().numpy().astype(np.float32), patches.reshape(-1, patch_grid, patch_grid, patches.shape[-1]).cpu().numpy().astype(np.float32)
+
+    def _letterbox(self, image: np.ndarray) -> np.ndarray:
+        if image is None or image.size == 0:
+            raise ValueError("Cannot embed an empty image.")
+        height, width = image.shape[:2]
+        scale = min(self.settings.input_size / width, self.settings.input_size / height)
+        resized = cv2.resize(image, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_LINEAR)
+        pad_x = self.settings.input_size - resized.shape[1]
+        pad_y = self.settings.input_size - resized.shape[0]
+        return cv2.copyMakeBorder(resized, pad_y // 2, pad_y - pad_y // 2, pad_x // 2, pad_x - pad_x // 2, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
     def _prepare(self, image: np.ndarray) -> "object":
         if image is None or image.size == 0:

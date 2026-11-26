@@ -33,8 +33,9 @@ def test_duplicate_ok_images_are_kept_within_one_split_group(tmp_path):
 
     bank, audit, metadata = split_ok_images(discover_ok_images(tmp_path), audit_fraction=0.5, seed=1)
 
-    assert not ({"a.png", "a_copy.png"} <= {path.name for path in bank})
-    assert ({"a.png", "a_copy.png"} <= {path.name for path in audit}) or not ({"a.png", "a_copy.png"} & {path.name for path in audit})
+    duplicate_names = {"a.png", "a_copy.png"}
+    assert not (duplicate_names <= {path.name for path in bank})
+    assert not ({path.name for path in bank} & duplicate_names and {path.name for path in audit} & duplicate_names)
+    assert len({path.name for path in audit} & duplicate_names) <= 1
     assert metadata["unique_ok_image_groups"] == 3
     assert metadata["duplicate_ok_images_excluded_from_bank"] == 1
-    assert {path.name for path in bank} | {path.name for path in audit} == {"a.png", "a_copy.png", "b.png", "c.png"}

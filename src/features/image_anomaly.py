@@ -36,7 +36,7 @@ def analyze_images(image_paths: list[Path], extractor: DinoV2Extractor, prototyp
     return maps
 
 
-def find_missing_annotation_candidates(image_maps: dict[str, np.ndarray], records: list[dict[str, Any]], high_threshold: float, config: dict[str, Any]) -> list[dict[str, Any]]:
+def find_missing_annotation_candidates(image_maps: dict[str, np.ndarray], records: list[dict[str, Any]], high_thresholds: float | dict[str, float], config: dict[str, Any]) -> list[dict[str, Any]]:
     records_by_image: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         records_by_image[record["image_path"]].append(record)
@@ -55,6 +55,7 @@ def find_missing_annotation_candidates(image_maps: dict[str, np.ndarray], record
             mask[-edge_margin:, :] = 255
             mask[:, :edge_margin] = 255
             mask[:, -edge_margin:] = 255
+        high_threshold = high_thresholds[image_path] if isinstance(high_thresholds, dict) else high_thresholds
         active = ((anomaly_map > high_threshold) & (mask == 0)).astype(np.uint8)
         component_count, labels, stats, _ = cv2.connectedComponentsWithStats(active)
         for component_id in range(1, component_count):
@@ -66,10 +67,11 @@ def find_missing_annotation_candidates(image_maps: dict[str, np.ndarray], record
     return sorted(candidates, key=lambda item: item["peak_anomaly"], reverse=True)
 
 
-def find_ok_contamination_candidates(image_maps: dict[str, np.ndarray], high_threshold: float, config: dict[str, Any]) -> list[dict[str, Any]]:
+def find_ok_contamination_candidates(image_maps: dict[str, np.ndarray], high_thresholds: float | dict[str, float], config: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = []
     minimum = config["missing_annotation_scan"]["minimum_component_area_px"]
     for image_path, anomaly_map in image_maps.items():
+        high_threshold = high_thresholds[image_path] if isinstance(high_thresholds, dict) else high_thresholds
         active = (anomaly_map > high_threshold).astype(np.uint8)
         component_count, labels, stats, _ = cv2.connectedComponentsWithStats(active)
         for component_id in range(1, component_count):

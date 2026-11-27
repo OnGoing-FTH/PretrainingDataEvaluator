@@ -82,7 +82,7 @@ python scripts/run_stage1.py --input-dir data --top-n 100
 
 ## Stage 2：DINOv2 Patch 双流异常审查
 
-Stage 2 复用 `dinov2_vitb14_reg` 的 `32 x 32` Patch Token。由隔离 OK_Bank 聚合同位置正常 Patch 原型，并允许 Query 在相邻 `2` 个 Patch 的位置半径内寻找最相似正常原型；Patch 阈值只由独立 OK_Audit 标定。实例流评估 Polygon 内外的异常分布，用于发现疑似虚标、粗标和边界错位；整图流通过重叠滑窗的最小异常距离融合，屏蔽现有标注后提取疑似漏标，同时审查 Audit OK 图是否存在污染。
+Stage 2 复用 `dinov2_vitb14_reg` 的 `32 x 32` Patch Token，并直接继承新版 Stage 1 的 OK 图簇、簇内 OK_Bank/Audit、归一化对齐位置与中位数展示参考。每个实例/滑窗只与**同簇、同归一化位置**的全部 OK 参考逐位置比较，Patch 分数是多参考余弦距离均值；Stage 1 选出的中位数距离 OK Tile 仅用于可视化对照。Patch 阈值按簇由独立 OK_Audit 标定。实例流评估 Polygon 内外的异常分布，用于发现疑似虚标、粗标和边界错位；整图流通过重叠滑窗的最小异常距离融合，屏蔽现有标注后提取疑似漏标，同时审查 Audit OK 图是否存在污染。
 
 ```bash
 source /home/fth/miniconda3/bin/activate
@@ -92,20 +92,17 @@ python scripts/run_stage2.py --input-dir data --top-n 100
 
 报告写入 `outputs/reports/stage2/`，包括疑似虚标、粗标/错位、疑似漏标和 OK 污染四类 HTML 图集；机器可读的阈值、实例指标、候选清单和 Patch 原型写入 `outputs/artifacts/stage2/`。不保存无必要的全量高分辨率异常图，避免审查产物膨胀。
 
-## 五大指导图集生成
+## 新版指导图集（1、3、5）
 
 完成 Stage 0–2 后执行：
 
 ```bash
-python -m pip install -r configs/guidance-requirements.txt
 python scripts/run_guidance.py --top-n 100
 ```
 
-统一入口为 `outputs/reports/guidance/index.html`，包含过标/虚标三联图、灰区概率梯度与逐类 UMAP/HDBSCAN 九宫格、粗标污染高亮图、漏标全图定位及放大热图、Proto 消失/断裂对照，以及人工复核 SOP。完整指标、折外预测、分组隔离证据、子簇信息和实例 CLS 特征写入 `outputs/artifacts/guidance/`；不生成 CSV，也不改写标注。
+入口为 `outputs/reports/guidance/index.html`。新版覆盖图集 1（疑似虚标）、图集 3（粗标/多点/边界错位）、图集 5（Proto 风险 × 视觉证据）；图集 2、4 待独立迁移，旧页不从新版首页链接。
 
-灰区探针使用按原图 SHA-256 分组的五折逻辑回归，所有同图实例及精确重复图像均留在同一折。概率为未校准模型分数，0.40–0.60 为核心灰区，0.35–0.65 为展示上下文。形态子簇使用 CLS 与 0.3 倍标准化几何特征；UMAP 用于展示，HDBSCAN 在组合特征空间聚类。少于 10 个实例的类别跳过聚类。图集 4 复用 Stage 2 的候选，OK 图审查范围为 Audit，按图像哈希和候选位置归并重复项。
-
-当前 Stage 1 未保存实例 CLS，Stage 2 未保存用于图集的异常图，因此首次生成会补算实例 CLS/Patch 和候选局部热图；不重建正常库。单次前向同时复用 CLS 和 Patch。所有热图使用统一的高阈值色标，局部热图为中心上下文重算结果，与滑窗融合分数分别解释。
+Guidance 按 `instance_id` 联结 Stage 0–2 的 JSON，不运行 DINOv2、不重建 Bank，也不修改标注。实例页只复用 Stage 2 当前图集实际发布且对齐可信的热图，缺失或无法对齐时明确标记；中位数 OK Tile 仅供对照。自定义 Stage 2 报告路径可使用 `--stage2-report-dir`。`--top-n` 只限制 HTML 展示，完整候选、`evidence_index.json` 和 `summary_135.json` 写入 `outputs/artifacts/guidance/`，无 CSV。
 
 ## 数据约定
 

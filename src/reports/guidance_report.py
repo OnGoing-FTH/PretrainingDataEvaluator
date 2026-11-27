@@ -1,192 +1,258 @@
-"""五大指导图集：原生 HTML/SVG 文字、PNG 图像面板和人工复核 SOP。"""
+"""新版 Stage 1/2 证据驱动的 Guidance 图集 1、3、5。"""
+
 from __future__ import annotations
-import hashlib
+
 import html
 import json
-from collections import Counter, defaultdict
+import os
+import re
+from collections import Counter
 from pathlib import Path
+from typing import Any
+
 import cv2
 import numpy as np
-from src.features.dinov2_extractor import read_bgr
-from src.features.ok_bank import crop_centered_tile
-from src.geometry.polygons import rasterize_polygon
+
 from src.geometry.letterbox import make_letterbox_transform
+from src.geometry.polygons import rasterize_polygon
 from src.geometry.proto_simulator import simulate_proto
 
 
-def esc(value):
-    return html.escape(str(value), quote=True)
+def write_guidance_135(records: list[dict[str, Any]], stage1_queries: list[dict[str, Any]], stage2_metrics: list[dict[str, Any]], report_dir: Path, artifact_dir: Path, top_n: int, *, image_root: Path = Path('.'), stage2_report_dir: Path | None = None) -> dict[str, Any]:
+    """只消费已有阶段产物，不重新推理、聚类或搜索 OK Bank。"""
+    record_by_id = _index(records, 'Stage 0')
+    stage1_by_id = _index(stage1_queries, 'Stage 1')
+    stage2_by_id = _index(stage2_metrics, 'Stage 2')
+    for stage, index in [('Stage 1', stage1_by_id), ('Stage 2', stage2_by_id)]:
+        if set(index) - set(record_by_id):
+            raise ValueError(f'{stage} 包含不在 Stage 0 中的实例')
+    for identifier, two in stage2_by_id.items():
+        one = stage1_by_id.get(identifier)
+        record = record_by_id[identifier]
+        if two['patch_score_metric'] != 'same_cluster_same_position_mean_patch_cosine_distance':
+            raise ValueError(f'{identifier}: 不支持旧版 Stage 2 Patch 度量')
+        keys = ('image_path', 'label', 'assigned_ok_cluster_id', 'bank_support', 'normalized_center', 'median_ok_tile')
+        if (one is None or any(one[key] != two[key] for key in keys)
+                or any(record[key] != two[key] for key in ('image_path', 'label', 'polygon_points'))):
+            raise ValueError(f'{identifier}: Stage 0/1/2 实例证据不一致')
+    report_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    heats = _published_heats(stage2_report_dir)
+    _write_json(artifact_dir / 'evidence_index.json', {
+        identifier: {'stage0': record, 'stage1': stage1_by_id.get(identifier), 'stage2': stage2_by_id.get(identifier)}
+        for identifier, record in record_by_id.items()
+    })
 
+    overlabel = _overlabel_candidates(records, stage1_by_id, stage2_by_id)
+    mask_quality = _mask_quality_candidates(records, stage1_by_id, stage2_by_id)
+    proto = _proto_candidates(records, stage1_by_id, stage2_by_id)
+    payload = {"overlabel": overlabel, "mask_quality": mask_quality, "proto_visual_joint": proto}
+    for name, value in payload.items():
+        _write_json(artifact_dir / f'guidance_{name}.json', value)
 
-def shell(title,content,path):
-    path.write_text(f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title><style>
-body{{margin:0;background:#f1f5f9;color:#172033;font-family:Arial,'Microsoft YaHei',sans-serif}}main{{max-width:1600px;margin:auto;padding:28px}}article,section{{background:white;border:1px solid #cbd5e1;padding:20px;margin:20px 0}}.panels{{display:flex;gap:16px;flex-wrap:wrap}}figure{{flex:1;min-width:240px;margin:0}}img{{width:100%;max-height:540px;object-fit:contain;background:#111}}figcaption{{font-weight:bold;margin:8px 0}}p{{line-height:1.7}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}a{{color:#075985}}.muted{{color:#64748b}}svg{{max-width:100%;height:auto}}details{{margin:12px 0}}table{{border-collapse:collapse;width:100%}}td,th{{padding:10px;border:1px solid #cbd5e1;text-align:left}}@media(max-width:700px){{.grid{{grid-template-columns:1fr}}}}@keyframes pulse{{50%{{opacity:.35}}}}.peak{{animation:pulse 1.4s infinite}}@media(prefers-reduced-motion:reduce){{.peak{{animation:none}}}}
-</style></head><body><main><a href="index.html">返回五大图集</a><h1>{esc(title)}</h1><p class="muted">所有候选均需人工复核。阈值、聚类与探针结果不直接决定标签变更；图像颜色不代表确认缺陷。</p>{content}</main></body></html>''',encoding='utf-8')
-
-
-def save(image,name,directory):
-    path = directory/'samples'/f'{name}.png'
-    path.parent.mkdir(parents=True,exist_ok=True)
-    if not cv2.imwrite(str(path),image):
-        raise OSError(path)
-    return 'samples/'+path.name
-
-
-def figure(path,caption):
-    return f'<figure><figcaption>{esc(caption)}</figcaption><img loading="lazy" src="{esc(path)}" alt="{esc(caption)}"></figure>'
-
-
-def tile_for(record):
-    x1,y1,x2,y2 = record['geometry']['bbox_xyxy']
-    cx,cy=(x1+x2)/2,(y1+y2)/2
-    origin=np.asarray([round(cx-224),round(cy-224)])
-    tile,_=crop_centered_tile(read_bgr(Path(record['image_path'])),cx,cy,448)
-    points=np.rint(np.asarray(record['polygon_points'])-origin).astype(np.int32)
-    return tile,points
-
-
-def overlay(tile,anomaly,thresholds):
-    # 全部面板共享标尺：0 到高风险阈值，避免逐图自动拉伸造成误导。
-    scale=np.clip(anomaly.astype(np.float32)/max(thresholds['high_threshold'],1e-8),0,1)
-    heat=cv2.applyColorMap((scale*255).astype(np.uint8),cv2.COLORMAP_JET)
-    return cv2.addWeighted(tile,.45,heat,.55,0)
-
-
-def panel_set(record,metric,anomaly,thresholds,directory,mode):
-    tile,points=tile_for(record)
-    source=tile.copy()
-    cv2.polylines(source,[points],True,(0,255,255),2)
-    if mode=='over':
-        x,y,w,h=cv2.boundingRect(points)
-        for offset in range(0,max(w,h),12):
-            if offset<w:
-                for yy in (y,y+h): cv2.line(source,(x+offset,yy),(min(x+w,x+offset+6),yy),(255,255,255),1)
-            if offset<h:
-                for xx in (x,x+w): cv2.line(source,(xx,y+offset),(xx,min(y+h,y+offset+6)),(255,255,255),1)
-    heat=overlay(tile,anomaly,thresholds)
-    cv2.polylines(heat,[points],True,(255,255,255),1)
-    key=hashlib.sha256(record['instance_id'].encode()).hexdigest()[:16]+mode
-    panels=[figure(save(source,key+'source',directory),'原图＋Polygon（黄色）'),figure(save(heat,key+'heat',directory),'异常图＋Polygon；各图共用分数标尺')]
-    if mode=='over':
-        meta=metric['nearest_ok_tile']
-        normal=read_bgr(Path(meta['image_path']))[meta['y']:meta['y']+meta['height'],meta['x']:meta['x']+meta['width']]
-        panels.append(figure(save(normal,key+'normal',directory),'最近真实 OK Tile：'+Path(meta['image_path']).name))
-    else:
-        mask=rasterize_polygon(points,448,448)>0
-        pollution=tile.copy()
-        pollution[mask & (anomaly<thresholds['warning_threshold'])]=(0,255,0)
-        cv2.polylines(pollution,[points],True,(0,255,255),1)
-        panels.append(figure(save(pollution,key+'pollution',directory),'亮绿色：Mask 内低异常背景候选'))
-    return '<div class="panels">'+''.join(panels)+'</div>'
-
-
-def write_guidance(records,metrics,maps,clusters,missing,contamination,thresholds,directory,top_n,candidate_maps):
-    directory.mkdir(parents=True,exist_ok=True)
-    lookup={r['instance_id']:r for r in records}
-    over=sorted([m for m in metrics if m['overlabel']],key=lambda m: (m['ok_neighbor_ratio'], -m['mask_mean_anomaly']),reverse=True)
-    coarse=sorted([m for m in metrics if m['coarse'] or m['misaligned']],key=lambda m:max(m['mask_normal_pixel_ratio'],m['outer_ring_anomaly']-m['inner_ring_anomaly']),reverse=True)
-    for items,mode,title,filename in [(over,'over','图集 1：疑似过标 / 虚标','01_overlabel.html'),(coarse,'coarse','图集 3：粗标 / 多点 / 错位','03_mask_quality.html')]:
-        cards=[]
-        for m in items[:top_n]:
-            r=lookup[m['instance_id']]
-            cards.append(f'<article><h2>{esc(r["label"])} · {esc(r["instance_id"])}</h2><p>来源：{esc(r["image_path"])}；Mask 异常 {m["mask_mean_anomaly"]:.4f}；Mask/背景比 {m["mask_background_ratio"]:.3f}；OK 邻居 {m["ok_neighbor_ratio"]:.1%}；正常背景占比 {m["mask_normal_pixel_ratio"]:.1%}；内/外环 {m["inner_ring_anomaly"]:.4f}/{m["outer_ring_anomaly"]:.4f}；高异常连通域 {m["high_components"]}</p>'+panel_set(r,m,maps[r['instance_id']],thresholds,directory,mode)+'<p>复核建议：核对缺陷定义及实际轮廓；确认正常纹理、多点分布或边界错位后再决定豁免、拆分或重画。</p></article>')
-        shell(title,f'<p>共 {len(items)} 个候选，展示前 {min(len(items),top_n)} 个。弱标需同时满足局部弱异常、Mask/背景比 &lt;1.15、混合 KNN 的 OK 占比 &gt;80%。背景不可比较时不触发弱标结论。</p>'+(''.join(cards) or '<p>无满足全部条件的候选。</p>'),directory/filename)
-    write_gray(records,metrics,clusters,directory,top_n)
-    missing_summary=write_missing(records,missing,contamination,directory,top_n,candidate_maps,thresholds)
-    proto_count=write_proto(records,directory,top_n)
-    gray=sum(m['gray_zone'] for m in metrics)
-    summary={'instances':len(records),'overlabel_candidates':len(over),'gray_zone_instances':gray,'coarse_or_misaligned_instances':len(coarse),'missing_review_regions':missing_summary,'proto_candidates':proto_count,'top_n':top_n,'warning_threshold':thresholds['warning_threshold'],'high_threshold':thresholds['high_threshold']}
-    links=[('01_overlabel.html','图集 1：疑似过标 / 虚标',len(over)),('02_gray_and_clusters.html','图集 2：灰区对齐与形态拆类',gray),('03_mask_quality.html','图集 3：粗标 / 多点 / 错位',len(coarse)),('04_missing.html','图集 4：疑似漏标扫雷',missing_summary),('05_proto.html','图集 5：Proto 消失 / 断裂',proto_count)]
-    content='<p>输入 832×832，Proto 208×208；DINOv2 视野 448×448。不同图集可包含同一实例，计数不可相加。默认展示 Top 100，完整指标见 JSON 产物。</p><table><tr><th>图集入口</th><th>候选数量</th></tr>'+''.join(f'<tr><td><a href="{name}">{title}</a></td><td>{count}</td></tr>' for name,title,count in links)+'</table><p><a href="sop.html">标注复核与修改 SOP</a></p><p>Patch 低阈值 '+str(thresholds['warning_threshold'])+'；高阈值 '+str(thresholds['high_threshold'])+'。全图候选复用 Stage 2 输出；OK 来源属于独立 Audit，不能代表全体 Bank 已排除污染。</p>'
-    shell('五大可视化指导图集',content,directory/'index.html')
-    shell('标注复核与修改 SOP','''<ol><li>先检查图集 5：对 Proto 严重消失或断裂的类别讨论切图训练或最小可标尺寸；超过 15% 的类别先统一训练与标注策略。</li><li>图集 1：对照真实 OK 参考核对定义，禁止仅凭低异常分删除真实小缺陷。</li><li>图集 2：专家用概率梯度页统一 OK/NG 边界；子簇只作为形态讨论依据，噪声簇不代表错误标签，也不自动拆类。</li><li>图集 3：亮绿色区域需核对正常背景；多个独立缺陷按实例规则拆分，偏移轮廓应重画。</li><li>图集 4：先排除边缘、照明及结构差异，再在原图位置补标。OK Audit 的重复文件属于同一审查事件。</li><li>争议缺陷若决定豁免，不应仅删除多边形而让可见缺陷作为普通背景继续训练。按项目流程隔离整图，或经人工批准制作可追溯的图像修订。</li><li>记录实例 ID、原文件、结论、审核人及原因；本工具只产生候选与建议，所有修订由人工确认。</li></ol>''',directory/'sop.html')
+    _write_overlabel(record_by_id, overlabel, report_dir / '01_overlabel.html', top_n, image_root, heats)
+    _write_mask_quality(record_by_id, mask_quality, report_dir / '03_mask_quality.html', top_n, image_root, heats)
+    _write_proto(record_by_id, proto, report_dir / '05_proto.html', top_n)
+    summary = {
+        "scope": "Guidance 1/3/5 rebuilt from Stage 0 + clustered Stage 1 + multi-reference Stage 2 artifacts",
+        "instances": len(records),
+        "overlabel_candidates": len(overlabel),
+        "mask_quality_candidates": len(mask_quality),
+        "proto_visual_joint_candidates": len(proto),
+        "top_n": top_n,
+        "without_stage1": len(record_by_id.keys() - stage1_by_id.keys()),
+        "without_stage2": len(record_by_id.keys() - stage2_by_id.keys()),
+    }
+    _write_json(artifact_dir / 'summary_135.json', summary)
+    _write_index(summary, report_dir / "index.html")
     return summary
 
 
-def write_gray(records,metrics,clusters,directory,top_n):
-    lookup={r['instance_id']:r for r in records}
-    candidates=sorted([m for m in metrics if .35<=m['probe_probability']<=.65],key=lambda m:abs(m['probe_probability']-.5))[:top_n]
-    candidates.sort(key=lambda m:m['probe_probability'])
-    content='<p>五折逻辑回归按原图 SHA-256 分组；同图实例和重复文件不跨训练/验证折。0.40–0.60 为核心灰区；0.35–0.65 为上下文展示范围。概率仅为模型分数，未作概率校准。</p><div class="grid">'
-    for m in candidates:
-        r=lookup[m['instance_id']]; tile,points=tile_for(r)
-        cv2.polylines(tile,[points],True,(0,255,255),2)
-        name=hashlib.sha256(r['instance_id'].encode()).hexdigest()[:16]+'gray'
-        content+='<section>'+figure(save(tile,name,directory),f"P(NG)={m['probe_probability']:.3f} · {r['label']} · {r['instance_id']}")+f'<p>{"核心灰区" if m["gray_zone"] else "边界对照"}；验证折 {m["fold"]}</p></section>'
-    content+='</div><h2>逐类别形态子簇</h2><p>组合特征为 CLS＋0.3×标准化几何特征。UMAP 用于展示；HDBSCAN 在组合特征空间聚类。近 OK 子簇按成员到正常库的平均最近余弦距离确定，不把 UMAP 图上的距离当作量化依据。</p>'
-    for result in clusters:
-        content+=f'<article><h2>{esc(result["label"])}</h2>'
-        if result['status']!='ok':
-            content+=f'<p>样本不足（{result["sample_count"]}），跳过聚类。</p></article>';continue
-        xy=np.asarray(result['coordinates']); xy=(xy-xy.min(axis=0))/np.maximum(np.ptp(xy,axis=0),1e-8)
-        colors=['#2563eb','#dc2626','#16a34a','#9333ea','#ea580c','#0891b2']
-        svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 440" role="img" aria-label="UMAP 类别子簇"><rect width="800" height="440" fill="#fff"/>'
-        for point,cluster,index in zip(xy,result['clusters'],result['indices']):
-            color='#94a3b8' if cluster==-1 else colors[cluster%len(colors)]
-            svg+=f'<circle cx="{40+point[0]*720:.2f}" cy="{30+point[1]*370:.2f}" r="5" fill="{color}"><title>{esc(records[index]["instance_id"])} 簇 {cluster}</title></circle>'
-        svg+='<text x="30" y="430" font-size="16">UMAP 展示坐标；灰色为噪声点</text></svg>'
-        content+=svg
-        for group in result['groups']:
-            close=' · 最接近 OK 的有效子簇' if group['cluster']==result['nearest_ok_cluster'] else ''
-            content+=f'<h3>{"噪声组" if group["noise"] else "子簇 "+str(group["cluster"])}{close}</h3><p>样本 {group["sample_count"]}；平均填充率 {group["mean_fill_ratio"]:.3f}；平均面积 {group["mean_area_px"]:.1f}px；最近 OK 平均距离 {group["mean_nearest_ok_distance"]:.4f}</p><div class="grid">'
-            for identifier in group['representative_ids']:
-                r=lookup[identifier]; tile,points=tile_for(r); cv2.polylines(tile,[points],True,(0,255,255),2)
-                name=hashlib.sha256(identifier.encode()).hexdigest()[:16]+'cluster'
-                content+=figure(save(tile,name,directory),identifier)
-            content+='</div>'
-        content+='</article>'
-    shell('图集 2：灰区对齐与形态拆类',content,directory/'02_gray_and_clusters.html')
+def _write_json(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def write_missing(records,missing,contamination,directory,top_n,candidate_maps,thresholds):
-    by_image=defaultdict(list)
-    for record in records: by_image[record['image_path']].append(record)
-    seen=set();items=[];hashes={}
-    for item in sorted(missing+contamination,key=lambda m:m['peak_anomaly'],reverse=True):
-        path=item['image_path']
-        if path not in hashes: hashes[path]=hashlib.sha256(Path(path).read_bytes()).hexdigest()
-        key=(hashes[path],tuple(item['bbox_xywh']))
-        if key in seen: continue
-        seen.add(key);items.append(item)
-    content='<p>按峰值分数降序；精确重复图像的同位置候选合并。绿色轮廓为已有标注，红框为待审查位置。候选复用 Stage 2，OK 扫描范围为 Audit；边缘候选可能来自照明或上下文不足。</p>'
-    for i,item in enumerate(items[:top_n]):
-        image=read_bgr(Path(item['image_path']));h,w=image.shape[:2]
-        scale=min(900/w,650/h); thumb=cv2.resize(image,(round(w*scale),round(h*scale)))
-        for r in by_image.get(item['image_path'],[]): cv2.polylines(thumb,[np.rint(np.asarray(r['polygon_points'])*scale).astype(np.int32)],True,(0,255,0),2)
-        x,y,bw,bh=item['bbox_xywh']
-        tile,_=crop_centered_tile(image,x+bw/2,y+bh/2,448)
-        origin=np.asarray([round(x+bw/2-224),round(y+bh/2-224)])
-        heat=overlay(tile,candidate_maps[(item['image_path'],tuple(item['bbox_xywh']))],thresholds)
-        for panel in (tile,heat):
-            cv2.rectangle(panel,tuple((np.asarray([x,y])-origin).astype(int)),tuple((np.asarray([x+bw,y+bh])-origin).astype(int)),(0,0,255),2)
-        source=save(thumb,f'missing_{i}_full',directory)
-        local=save(np.hstack([tile,heat]),f'missing_{i}_local',directory)
-        svg=f'<svg viewBox="0 0 {thumb.shape[1]} {thumb.shape[0]}" xmlns="http://www.w3.org/2000/svg"><image href="{source}" width="100%" height="100%"/><rect class="peak" x="{x*scale}" y="{y*scale}" width="{bw*scale}" height="{bh*scale}" fill="none" stroke="red" stroke-width="3"/></svg>'
-        content+=f'<article><h2>{esc(Path(item["image_path"]).name)}</h2><p>坐标 {item["bbox_xywh"]}；峰值 {item["peak_anomaly"]:.4f}；面积 {item["area_px"]}px。来源：{esc(item["image_path"])}</p><div class="panels"><figure><figcaption>全图定位</figcaption>{svg}</figure>{figure(local,"448×448 高清局部；红框为候选")}</div><p>复核建议：在原图确认真实缺陷后补标；边缘亮带、产品结构和照明变化应先排除。</p></article>'
-    shell('图集 4：疑似漏标扫雷',content,directory/'04_missing.html')
-    return len(items)
+def _index(items, stage):
+    index = {item['instance_id']: item for item in items}
+    if len(index) != len(items):
+        raise ValueError(f'{stage} 存在重复 instance_id')
+    return index
 
 
-def write_proto(records,directory,top_n):
-    flagged=[r for r in records if r['proto']['iou_proto']<.35 or r['proto']['proto_nonzero_pixels']<4 or r['proto']['fragmented']]
-    flagged.sort(key=lambda r:r['risk']['score'],reverse=True)
-    total=Counter(r['label'] for r in records);count=Counter(r['label'] for r in flagged)
-    content='<p>固定训练输入 832×832，Proto 208×208。展示原始标注在训练画布上的局部视图，以及 208 网格后还原的相同区域。</p><table><tr><th>类别</th><th>风险占比</th><th>策略提示</th></tr>'
-    for label,n in total.items():
-        ratio=count[label]/n
-        content+=f'<tr><td>{esc(label)}</td><td>{count[label]}/{n} = {ratio:.1%}</td><td>{"超过 15%，需统一切图/最小尺寸策略" if ratio>.15 else "逐例复核"}</td></tr>'
-    content+='</table>'
-    for r in flagged[:top_n]:
-        image=read_bgr(Path(r['image_path']));h,w=image.shape[:2]
-        mask=rasterize_polygon(np.asarray(r['polygon_points'],np.float32),w,h)
-        transform=make_letterbox_transform(w,h,832)
-        canvas=transform.apply_to_mask(mask)
-        proto=simulate_proto(canvas)
-        points=transform.map_points(np.asarray(r['polygon_points'],np.float32));x,y,bw,bh=cv2.boundingRect(np.rint(points).astype(np.int32))
-        left,top,right,bottom=max(0,x-15),max(0,y-15),min(832,x+bw+15),min(832,y+bh+15)
-        key=hashlib.sha256(r['instance_id'].encode()).hexdigest()[:16]
-        original=save(((canvas[top:bottom,left:right]>0)*255).astype(np.uint8),key+'proto_source',directory)
-        restored=save(proto.restored_mask[top:bottom,left:right]*255,key+'proto_restored',directory)
-        content+=f'<article><h2>{esc(r["label"])} · {esc(r["instance_id"])}</h2><p>IoU {r["proto"]["iou_proto"]:.3f}；Proto 像素 {r["proto"]["proto_nonzero_pixels"]}；断裂 {r["proto"]["fragmented"]}</p><div class="panels">{figure(original,"原始 Mask 在 832 训练画布的局部")}{figure(restored,"208 Proto 后还原的相同局部")}<section><h3>人工复核建议</h3><p>{esc("；".join(r["risk"]["recommendations"]))}</p><p>先评估保留原始分辨率的切图方案与最小有效标注尺寸；外扩宽度应由业务 SOP 确认，不自动改变 Polygon。</p></section></div></article>'
-    shell('图集 5：Proto 消失 / 断裂预警',content,directory/'05_proto.html')
-    return len(flagged)
+def _published_heats(directory):
+    """仅复用当前图集明确引用、且文件名与卡片 ID 一致的图像。"""
+    hits = {}
+    if directory is None:
+        return hits
+    for name in ('suspected_overlabel_gallery.html', 'coarse_or_misaligned_mask_gallery.html'):
+        page = directory / name
+        if not page.is_file():
+            continue
+        for card in re.findall(r'<article>(.*?)</article>', page.read_text(encoding='utf-8'), re.S):
+            label = re.search(r'<small>([^<]+)</small>', card)
+            if not label:
+                continue
+            identifier = html.unescape(label[1])
+            stem = identifier.replace(':', '_').replace('/', '_')
+            relative = f'samples/{stem}_heat.png'
+            if f"src='{_esc(relative)}'" in card and (directory / relative).is_file():
+                hits[identifier] = directory / relative
+    return hits
+
+
+def _overlabel_candidates(records: list[dict[str, Any]], stage1: dict[str, dict[str, Any]], stage2: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for record in records:
+        one, two = stage1.get(record["instance_id"]), stage2.get(record["instance_id"])
+        if not one or not two:
+            continue
+        if record["risk"]["level"] not in {"pass", "medium"}:
+            continue
+        if one["stage1_risk"] not in {"normal", "warning"} or one.get("cluster_assignment_ambiguous", False):
+            continue
+        if "suspected_weak_annotation" not in two["candidate_types"]:
+            continue
+        output.append({"instance_id": record["instance_id"], "priority": round(two["mask_normal_pixel_ratio"] - two["mask_mean_anomaly"], 8), "reason": "Stage1 同簇整体接近 OK，Stage2 Polygon 内多参考 Patch 异常弱，且 Proto 可学习。", "stage1": one, "stage2": two})
+    return sorted(output, key=lambda item: item["priority"], reverse=True)
+
+
+def _mask_quality_candidates(records: list[dict[str, Any]], stage1: dict[str, dict[str, Any]], stage2: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for record in records:
+        one, two = stage1.get(record["instance_id"]), stage2.get(record["instance_id"])
+        if not one or not two:
+            continue
+        kinds = set(two["candidate_types"])
+        relevant = kinds & {"suspected_coarse_or_multiple", "suspected_boundary_misalignment"}
+        if not relevant:
+            continue
+        priority = max(two["mask_normal_pixel_ratio"], two["outer_ring_anomaly"] - two["inner_ring_anomaly"], min(two["high_components"] / 3, 1.0))
+        output.append({"instance_id": record["instance_id"], "priority": round(priority, 8), "reason": "Stage2 同簇多参考 Patch 证据显示 Polygon 内背景比例高、存在多异常连通域或内外环异常反转。", "stage1": one, "stage2": two})
+    return sorted(output, key=lambda item: item["priority"], reverse=True)
+
+
+def _proto_candidates(records: list[dict[str, Any]], stage1: dict[str, dict[str, Any]], stage2: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for record in records:
+        is_proto_risk = bool({'proto_iou_below_threshold', 'proto_insufficient_pixels', 'proto_fragmented'} & set(record['risk']['reasons']))
+        if not is_proto_risk:
+            continue
+        one, two = stage1.get(record["instance_id"]), stage2.get(record["instance_id"])
+        visual = "unknown" if not two else "strong" if "strong_visual_anomaly" in two["candidate_types"] else "weak" if "suspected_weak_annotation" in two["candidate_types"] else "mixed"
+        output.append({"instance_id": record["instance_id"], "priority": record["risk"]["score"], "visual_evidence": visual, "stage1": one, "stage2": two})
+    return sorted(output, key=lambda item: item["priority"], reverse=True)
+
+
+def _shell(title: str, body: str, path: Path) -> None:
+    path.write_text(f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{_esc(title)}</title><style>body{{margin:0;background:#f1f5f9;color:#172033;font-family:Arial,'Microsoft YaHei','Noto Sans CJK SC',sans-serif}}main{{max-width:1800px;margin:auto;padding:28px}}article{{background:#fff;border:1px solid #cbd5e1;padding:20px;margin:20px 0}}.panels{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}}figure{{margin:0}}figcaption{{font-weight:700;margin:8px 0;font-size:17px}}img{{width:100%;max-height:540px;object-fit:contain;background:#111}}p{{line-height:1.6;font-size:17px}}small{{color:#475569}}dl{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}dt{{font-size:14px;color:#64748b}}dd{{font-size:19px;font-weight:700;margin:3px 0}}a{{color:#075985}}table{{border-collapse:collapse;width:100%;background:#fff}}td,th{{border:1px solid #cbd5e1;padding:10px;text-align:left}}@media(max-width:900px){{.panels,dl{{grid-template-columns:1fr}}}}</style></head><body><main><a href='index.html'>返回 Guidance 首页</a><h1>{_esc(title)}</h1><p>本页只编排 Stage 0、新版 Stage 1 和新版 Stage 2 已有证据；不会重建 OK Bank、重跑聚类或跨簇检索。所有候选均须人工复核。</p>{body}</main></body></html>""", encoding="utf-8")
+
+
+def _save_image(path, image):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f'无法写入图像：{path}')
+    return f'samples/{path.name}'
+
+
+def _panel(caption, url=None, note='图像不可用。'):
+    content = (f'<img loading="lazy" src="{_esc(url)}" alt="{_esc(caption)}">'
+               if url else f'<p>{_esc(note)}</p>')
+    return f'<figure><figcaption>{_esc(caption)}</figcaption>{content}</figure>'
+
+
+def _instance_panels(record, evidence, sample_dir, image_root, heats):
+    metric = evidence['stage2']
+    identifier = record['instance_id']
+    stem = identifier.replace(':', '_').replace('/', '_')
+    image = cv2.imread(str(image_root / record['image_path']))
+    source = normal = heat = None
+    note = 'Stage 2 当前图集未发布该实例的热图；此处不重新推理。'
+    if image is not None:
+        bbox = metric['query_tile']
+        x, y, w, h = (bbox[k] for k in ('x', 'y', 'width', 'height'))
+        query = image[y:y+h, x:x+w].copy()
+        if query.size:
+            points = np.rint(np.asarray(record['polygon_points']) - [x, y]).astype(np.int32)
+            cv2.polylines(query, [points], True, (0, 255, 255), 2)
+            source = _save_image(sample_dir / f'{stem}_query.png', query)
+            center = metric['normalized_center']
+            origin = (round(center['u'] * image.shape[1] - 224), round(center['v'] * image.shape[0] - 224))
+            if identifier in heats:
+                if origin == (x, y):
+                    heat = os.path.relpath(heats[identifier], sample_dir.parent)
+                else:
+                    note = '该热图涉及左侧或上侧裁切，现有 Stage 2 面板未校正填充偏移，不作对照。'
+    median = evidence['stage1']['median_ok_tile']
+    ok = cv2.imread(str(image_root / median['image_path']))
+    if ok is not None:
+        x, y, w, h = (median[k] for k in ('x', 'y', 'width', 'height'))
+        crop = ok[y:y+h, x:x+w]
+        if crop.size:
+            normal = _save_image(sample_dir / f'{stem}_median_ok.png', crop)
+    return '<div class="panels">' + ''.join([
+        _panel('缺陷 Query Tile + Polygon', source),
+        _panel('Stage 2 多参考 Patch 热图 + Polygon', heat, note),
+        _panel('Stage 1 中位数距离 OK 参考（仅展示，不单独计分）', normal),
+    ]) + '</div>'
+
+
+def _threshold_note(record, one, two):
+    return (f'<p>来源：{_esc(record["image_path"])}；'
+            f'Stage 1 簇内阈值：{one["low_threshold"]:.4f} / {one["high_threshold"]:.4f}；'
+            f'Stage 2 簇内阈值：{two["patch_low_threshold"]:.4f} / {two["patch_high_threshold"]:.4f}。</p>')
+
+
+def _write_overlabel(records, items, path, top_n, image_root, heats):
+    cards = []
+    for item in items[:top_n]:
+        record, one, two = records[item['instance_id']], item['stage1'], item['stage2']
+        panels = _threshold_note(record, one, two) + _instance_panels(record, item, path.parent / 'samples', image_root, heats)
+        cards.append(f"""<article><h2>{_esc(record['label'])} · <small>{_esc(record['instance_id'])}</small></h2><p>{_esc(item['reason'])}</p>{panels}<dl><div><dt>场景簇 / OK 参考数</dt><dd>{two['assigned_ok_cluster_id']} / {two['bank_support']}</dd></div><div><dt>Stage 1 状态 / 距离</dt><dd>{_esc(one['stage1_risk'])} / {one['distance_mean']:.4f}</dd></div><div><dt>Mask 异常均值</dt><dd>{two['mask_mean_anomaly']:.4f}</dd></div><div><dt>Mask 正常比例</dt><dd>{two['mask_normal_pixel_ratio']:.1%}</dd></div><div><dt>Proto</dt><dd>{_esc(record['risk']['level'])} / {record['proto']['iou_proto']:.3f}</dd></div></dl></article>""")
+    _shell("图集 1：疑似过标 / 虚标（新版分簇证据）", f"<p>候选规则：Stage 1 为 normal/warning、簇归属不模糊、Stage 2 为弱异常、Stage 0 为 pass/medium。共 {len(items)} 个候选，展示 {len(cards)} 个。</p>{''.join(cards) or '<p>没有符合联合规则的候选。</p>'}", path)
+
+
+def _write_mask_quality(records, items, path, top_n, image_root, heats):
+    cards = []
+    for item in items[:top_n]:
+        record, two = records[item['instance_id']], item['stage2']
+        panels = _threshold_note(record, item['stage1'], two) + _instance_panels(record, item, path.parent / 'samples', image_root, heats)
+        cards.append(f"""<article><h2>{_esc(record['label'])} · <small>{_esc(record['instance_id'])}</small></h2><p>{_esc(item['reason'])}</p>{panels}<dl><div><dt>场景簇 / OK 参考数</dt><dd>{two['assigned_ok_cluster_id']} / {two['bank_support']}</dd></div><div><dt>Mask 正常比例</dt><dd>{two['mask_normal_pixel_ratio']:.1%}</dd></div><div><dt>高异常连通域</dt><dd>{two['high_components']}</dd></div><div><dt>内 / 外环异常</dt><dd>{two['inner_ring_anomaly']:.4f} / {two['outer_ring_anomaly']:.4f}</dd></div><div><dt>规则</dt><dd>{_esc(', '.join(two['candidate_types']))}</dd></div></dl></article>""")
+    _shell("图集 3：粗标 / 一框包多点 / 边界错位（新版分簇证据）", f"<p>共 {len(items)} 个候选，展示 {len(cards)} 个。热图来自同簇、同位置全部 OK 参考的平均 Patch 距离；右图的中位数 OK 参考只供人工理解。</p>{''.join(cards) or '<p>没有候选。</p>'}", path)
+
+
+def _write_proto(records, items, path, top_n):
+    total = Counter(record["label"] for record in records.values())
+    counts = Counter(records[item['instance_id']]['label'] for item in items)
+    high = Counter(record['label'] for record in records.values() if record['risk']['level'] in {'high', 'critical'})
+    table = ''.join(f"<tr><td>{_esc(label)}</td><td>{counts[label]}/{count} = {counts[label]/count:.1%}</td><td>{high[label]/count:.1%}</td><td>{'超过 15%，建议统一切图/最小尺寸策略' if high[label]/count > .15 else '逐例复核'}</td></tr>" for label, count in sorted(total.items()))
+    cards = []
+    for item in items[:top_n]:
+        record = records[item['instance_id']]
+        width, height = (record['source_size'][k] for k in ('width', 'height'))
+        mask = rasterize_polygon(np.asarray(record["polygon_points"], dtype=np.float32), width, height)
+        transform = make_letterbox_transform(width, height, 832)
+        source = transform.apply_to_mask(mask)
+        restored = simulate_proto(source).restored_mask
+        points = transform.map_points(np.asarray(record["polygon_points"], dtype=np.float32))
+        x, y, box_w, box_h = cv2.boundingRect(np.rint(points).astype(np.int32))
+        left, top, right, bottom = max(0, x - 18), max(0, y - 18), min(832, x + box_w + 18), min(832, y + box_h + 18)
+        sample_dir = path.parent / "samples"; sample_dir.mkdir(parents=True, exist_ok=True)
+        stem = record["instance_id"].replace(":", "_").replace("/", "_")
+        source_path, restored_path = sample_dir / f"{stem}_proto_source.png", sample_dir / f"{stem}_proto_restored.png"
+        _save_image(source_path, (source[top:bottom, left:right] > 0).astype(np.uint8) * 255)
+        _save_image(restored_path, restored[top:bottom, left:right] * 255)
+        two = item.get("stage2")
+        evidence = item["visual_evidence"]
+        cards.append(f"""<article><h2>{_esc(record['label'])} · <small>{_esc(record['instance_id'])}</small></h2><div class='panels'><figure><figcaption>832 训练画布原始 Mask</figcaption><img src='samples/{_esc(source_path.name)}'></figure><figure><figcaption>208 Proto 后还原 Mask</figcaption><img src='samples/{_esc(restored_path.name)}'></figure><section><h3>视觉证据联动</h3><p>Stage 2：<strong>{_esc(evidence)}</strong></p><p>Stage 1：{_esc(item['stage1']['stage1_risk']) if item.get('stage1') else 'unknown'}</p><p>建议：视觉强但 Proto 不可学时优先讨论切图、提高有效尺寸或 SOP；视觉弱时不可仅据此删除标注。</p></section></div><dl><div><dt>IoU_proto</dt><dd>{record['proto']['iou_proto']:.3f}</dd></div><div><dt>Proto 像素</dt><dd>{record['proto']['proto_nonzero_pixels']}</dd></div><div><dt>断裂</dt><dd>{record['proto']['fragmented']}</dd></div><div><dt>Stage 2 Mask 均值</dt><dd>{format(two['mask_mean_anomaly'], '.4f') if two else '未评估'}</dd></div><div><dt>Stage 2 规则</dt><dd>{_esc(', '.join(two['candidate_types']) if two else 'n/a')}</dd></div></dl></article>""")
+    body = f"<p>Stage 0 物理风险为主，Stage 1/2 只补充视觉证据，不覆盖 Proto 判断。共 {len(items)} 个候选，展示 {len(cards)} 个；类别占比基于完整候选。</p><table><thead><tr><th>类别</th><th>Proto 候选比例</th><th>Stage 0 高/严重风险比例</th><th>策略</th></tr></thead><tbody>{table}</tbody></table>{''.join(cards) or '<p>未发现 Proto 风险实例。</p>'}"
+    _shell("图集 5：Proto 风险 × 视觉异常证据", body, path)
+
+
+def _write_index(summary: dict[str, Any], path: Path) -> None:
+    rows = [("01_overlabel.html", "图集 1：疑似过标 / 虚标", summary["overlabel_candidates"]), ("03_mask_quality.html", "图集 3：粗标 / 多点 / 错位", summary["mask_quality_candidates"]), ("05_proto.html", "图集 5：Proto 风险 × 视觉证据", summary["proto_visual_joint_candidates"])]
+    body = "<p>本次升级仅更新图集 1、3、5；图集 2（灰区/拆类）与图集 4（漏标）将另行按新版分簇语义重构，旧版结果不再作为新入口。</p><table><thead><tr><th>图集</th><th>候选数</th></tr></thead><tbody>" + "".join(f"<tr><td><a href='{name}'>{title}</a></td><td>{count}</td></tr>" for name, title, count in rows) + "</tbody></table>"
+    _shell("新版 Guidance 图集：1 / 3 / 5", body, path)
+
+
+def _esc(value: object) -> str:
+    return html.escape(str(value), quote=True)

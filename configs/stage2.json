@@ -6,16 +6,14 @@
   "feature": {
     "model_name": "dinov2_vitb14_reg",
     "input_size": 448,
-    "batch_size": 8,
+    "batch_size": 32,
     "device": "auto"
   },
   "tiles": {
     "size": 448,
     "stride": 358
   },
-  "position_constraint": {
-    "patch_radius": 2
-  },
+  "stage1_calibration_grid_size": 3,
   "patch_calibration": {
     "warning_percentile": 95.0,
     "high_percentile": 99.5,

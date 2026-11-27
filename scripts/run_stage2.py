@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "stage2.json")
     parser.add_argument("--report-dir", type=Path, default=ROOT / "outputs" / "reports" / "stage2")
     parser.add_argument("--artifact-dir", type=Path, default=ROOT / "outputs" / "artifacts" / "stage2")
+    parser.add_argument("--stage1-artifact-dir", type=Path, default=ROOT / "outputs" / "artifacts" / "stage1", help="新版 Stage 1 的聚类、多参考匹配产物目录")
     parser.add_argument("--top-n", type=int, default=None)
     return parser.parse_args()
 
@@ -31,7 +32,7 @@ def main() -> int:
     args = parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
     records, _ = run_stage0(args.input_dir, target_size=832, proto_stride=4)
-    summary, artifacts = run_stage2(args.input_dir, records, config)
+    summary, artifacts = run_stage2(args.input_dir, records, config, args.stage1_artifact_dir)
     top_n = args.top_n if args.top_n is not None else config["reports"]["top_n"]
     write_stage2_reports(summary, artifacts, args.report_dir, args.artifact_dir, top_n)
     print(f"Stage 2 complete: {summary['instance_count']} instances, {summary['missing_annotation_candidates']} missing-label candidates, {summary['ok_contamination_candidates']} OK contamination candidates.")

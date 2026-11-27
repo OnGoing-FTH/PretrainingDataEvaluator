@@ -68,7 +68,7 @@ class DinoV2Extractor:
     def _embed_batch_with_patches(self, images: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
         prepared = [self._prepare(image) for image in images]
         patch_grid = self.settings.input_size // 14
-        with self.torch.inference_mode():
+        with self.torch.inference_mode(), self.torch.autocast(device_type="cuda", dtype=self.torch.float16, enabled=self.device.startswith("cuda")):
             batch = self.torch.stack(prepared).to(self.device)
             batch = (batch - self._mean) / self._std
             output = self.model.forward_features(batch)
